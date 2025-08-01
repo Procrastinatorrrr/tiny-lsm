@@ -1,38 +1,52 @@
 #include "../../include/skiplist/skiplist.h"
+#include <cstddef>
 #include <cstdint>
 #include <iostream>
+#include <memory>
+#include <optional>
 #include <spdlog/spdlog.h>
 #include <stdexcept>
 #include <tuple>
+#include <type_traits>
 #include <utility>
+#include <vector>
 
 namespace tiny_lsm {
 
 // ************************ SkipListIterator ************************
 BaseIterator &SkipListIterator::operator++() {
   // TODO: Lab1.2 任务：实现SkipListIterator的++操作符
+  if(current){
+    current = current->forward_[0];
+  }
   return *this;
 }
 
 bool SkipListIterator::operator==(const BaseIterator &other) const {
   // TODO: Lab1.2 任务：实现SkipListIterator的==操作符
-  return true;
+  if(other.get_type() != IteratorType::SkipListIterator){
+    return false;
+  }
+  auto other2 = dynamic_cast<const SkipListIterator &>(other);
+  return current == other2.current;
 }
 
 bool SkipListIterator::operator!=(const BaseIterator &other) const {
   // TODO: Lab1.2 任务：实现SkipListIterator的!=操作符
-  return true;
+  return !(*this==other);
 }
 
 SkipListIterator::value_type SkipListIterator::operator*() const {
   // TODO: Lab1.2 任务：实现SkipListIterator的*操作符
-  return {"", ""};
+  if (!current)
+    throw std::runtime_error("Dereferencing invalid iterator");
+  return {current->key_, current->value_};
 }
 
 IteratorType SkipListIterator::get_type() const {
   // TODO: Lab1.2 任务：实现SkipListIterator的get_type
   // ? 主要是为了熟悉基类的定义和继承关系
-  return IteratorType::Undefined;
+  return IteratorType::SkipListIterator;
 }
 
 bool SkipListIterator::is_valid() const {
@@ -59,7 +73,11 @@ int SkipList::random_level() {
   // ? - 确保层数分布为：第1层100%，第2层50%，第3层25%，以此类推
   // ? - 层数范围限制在[1, max_level]之间，避免浪费内存
   // TODO: Lab1.1 任务：插入时随机为这一次操作确定其最高连接的链表层数
-  return 0;
+  int level = 1;
+  while(dis_01(gen) && level<max_level){
+    level++;
+  }
+  return level;
 }
 
 // 插入或更新键值对
@@ -71,16 +89,65 @@ void SkipList::put(const std::string &key, const std::string &value,
   // ? Hint: 你需要保证不同`Level`的步长从底层到高层逐渐增加
   // ? 你可能需要使用到`random_level`函数以确定层数, 其注释中为你提供一种思路
   // ? tranc_id 为事务id, 现在你不需要关注它, 直接将其传递到 SkipListNode 的构造函数中即可
+  auto level = random_level();
+  std::vector<std::shared_ptr<SkipListNode>> update(max_level, nullptr);
+  auto current = head;
+  for(int i=current_level-1; i>=0; i--){
+    while(current->forward_[i] && current->forward_[i]->key_<key){
+      current = current->forward_[i];
+    }
+    update[i] = current;
+  }
+  current = current->forward_[0];
+  if(current && current->key_==key){
+    size_bytes = size_bytes + value.size() - current->value_.size();
+    current->value_ = value;
+    spdlog::trace("SkipList--put({}, {}, {}), key and tranc_id_ is the same, "
+                  "only update value to {}",
+                  key, value, tranc_id, value);
+    return;
+  }
+  size_bytes += key.size() + value.size() + sizeof(uint64_t);
+  auto new_node = std::make_shared<SkipListNode>(key, value, level, tranc_id);
+  if(level > current_level){
+    update[current_level] = head;
+    level = current_level+1;
+    current_level = level;
+  }
+  for(auto i=0; i<level; i++){
+    new_node->forward_[i] = update[i]->forward_[i];
+    if(update[i]->forward_[i]){
+      update[i]->forward_[i]->set_backward(i, new_node);
+    }
+    update[i]->forward_[i] = new_node;
+    new_node->set_backward(i, update[i]);
+    spdlog::trace("SkipList--put({}, {}, {}), update level{}", key,
+                    value, tranc_id, i);
+  }
+  return;
 }
 
 // 查找键值对
 SkipListIterator SkipList::get(const std::string &key, uint64_t tranc_id) {
-  // spdlog::trace("SkipList--get({}) called", key);
+  spdlog::trace("SkipList--get({}) called", key);
   // ? 你可以参照上面的注释完成日志输出以便于调试
   // ? 日志为输出到你执行二进制所在目录下的log文件夹
 
   // TODO: Lab1.1 任务：实现查找键值对,
   // TODO: 并且你后续需要额外实现SkipListIterator中的TODO部分(Lab1.2)
+  auto current = head;
+  for(int i=current_level-1; i>=0; i--){
+    while(current->forward_[i] && current->forward_[i]->key_<key){
+      current = current->forward_[i];
+    }
+  }
+  current = current->forward_[0];
+  if(current && current->key_==key){
+    return SkipListIterator{current};
+  }
+  else{
+    spdlog::trace("SkipList--get({}): not found", key);
+  }
   return SkipListIterator{};
 }
 
@@ -89,6 +156,36 @@ SkipListIterator SkipList::get(const std::string &key, uint64_t tranc_id) {
 // ! 这里只是为了实现完整的 SkipList 不会真正被上层调用
 void SkipList::remove(const std::string &key) {
   // TODO: Lab1.1 任务：实现删除键值对
+  spdlog::trace("SkipList--remove({}) called", key);
+  std::vector<std::shared_ptr<SkipListNode>> update(max_level, nullptr);
+  auto current = head;
+  for(int i=current_level-1; i>=0; i--){
+    while(current->forward_[i] && current->forward_[i]->key_<key){
+      current = current->forward_[i];
+    }
+    update[i] = current;
+  }
+  current = current->forward_[0];
+  if (!current || current->key_ != key) {
+    spdlog::trace("SkipList--remove({}): key not found", key);
+    return;
+  }
+  size_bytes -= key.size() + current->value_.size() + sizeof(uint64_t);
+  for(auto i=0; i<current_level; i++){
+    if(update[i]->forward_[i] != current){
+      break;
+    }
+    if(current->forward_[i]){
+      current->forward_[i]->set_backward(i, update[i]);
+    }
+    update[i]->forward_[i] = current->forward_[i];
+    spdlog::trace("SkipList--remove({}): removed from level {}", 
+                 key, i);
+  }
+  while (current_level > 1 && !head->forward_[current_level - 1]) {
+    --current_level;
+  }
+  return;
 }
 
 // 刷盘时可以直接遍历最底层链表
@@ -133,13 +230,32 @@ SkipListIterator SkipList::end() {
 // 返回第一个前缀匹配或者大于前缀的迭代器
 SkipListIterator SkipList::begin_preffix(const std::string &preffix) {
   // TODO: Lab1.3 任务：实现前缀查询的起始位置
-  return SkipListIterator{};
+  spdlog::trace("SkipList--begin_preffix('{}') called", preffix);
+  auto current = head;
+  for(int i=current_level-1; i>=0; i--){
+    while(current->forward_[i] && current->forward_[i]->key_<preffix){
+      current = current->forward_[i];
+    }
+  }
+  current = current->forward_[0];
+  return SkipListIterator(current);
 }
 
 // 找到前缀的终结位置
 SkipListIterator SkipList::end_preffix(const std::string &prefix) {
   // TODO: Lab1.3 任务：实现前缀查询的终结位置
-  return SkipListIterator{};
+  spdlog::trace("SkipList--end_preffix('{}') called", prefix);
+  auto current = head;
+  for(int i=current_level-1; i>=0; i--){
+    while(current->forward_[i] && current->forward_[i]->key_<prefix){
+      current = current->forward_[i];
+    }
+  }
+  current = current->forward_[0];
+  while(current && current->key_.substr(0, prefix.size())==prefix){
+    current = current->forward_[0];
+  }
+  return SkipListIterator(current);
 }
 
 // ? 这里单调谓词的含义是, 整个数据库只会有一段连续区间满足此谓词
@@ -156,7 +272,26 @@ std::optional<std::pair<SkipListIterator, SkipListIterator>>
 SkipList::iters_monotony_predicate(
     std::function<int(const std::string &)> predicate) {
   // TODO: Lab1.3 任务：实现谓词查询的起始位置
-  return std::nullopt;
+  auto current = head;
+  // SkipListIterator begin_iter = SkipListIterator(nullptr);
+  // SkipListIterator end_iter = SkipListIterator(nullptr);
+  for(int i=current_level-1; i>=0; i--){
+    while(current->forward_[i] && predicate(current->forward_[i]->key_)>0){
+      current = current->forward_[i];
+    }
+  }
+  current = current->forward_[0];
+  if(!current || predicate(current->key_)!=0){
+    spdlog::trace("SkipList--iters_monotony_predicate(): no match found");
+    return std::nullopt;
+  }
+  auto begin_iter = SkipListIterator(current);
+  while(current && predicate(current->key_)==0){
+    current = current->forward_[0];
+  }
+  spdlog::trace("SkipList--iters_monotony_predicate(): range found");
+  auto end_iter = SkipListIterator(current);
+  return std::make_optional(std::pair<SkipListIterator, SkipListIterator>(begin_iter, end_iter));
 }
 
 // ? 打印跳表, 你可以在出错时调用此函数进行调试
